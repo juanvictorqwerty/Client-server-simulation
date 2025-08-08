@@ -224,7 +224,7 @@ class VirtualNode:
         print(self)
         while self.is_running:
             try:
-                command = input(">>> ").strip().split()
+                command = input(f"{self.name}>> ").strip().split()
                 if not command:
                     continue
                 cmd = command[0].lower()
