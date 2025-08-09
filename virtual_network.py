@@ -22,6 +22,12 @@ class CustomFTPHandler(FTPHandler):
             "expected_chunk_size": None
         }
 
+    def safe_rename(self, src, dst):
+        """Rename src -> dst, deleting dst if it already exists."""
+        if os.path.exists(dst):
+            os.remove(dst)
+        os.rename(src, dst)
+
     def on_file_received(self, file_path):
         """Handle chunk reception for nodes."""
         if file_path.endswith("disk_metadata.json"):
@@ -47,7 +53,7 @@ class CustomFTPHandler(FTPHandler):
             return
 
         filename = os.path.basename(file_path)
-        final_path = os.path.join(os.path.dirname(file_path), filename)
+        final_path = os.path.join(os.path.dirname(file_path), self.session_state["current_filename"] if self.session_state["current_filename"] else filename)
 
         if chunk_number == 1:
             self.session_state["current_filename"] = filename
@@ -72,12 +78,12 @@ class CustomFTPHandler(FTPHandler):
             with open(self.session_state["temp_file_path"], 'ab') as f:
                 f.write(payload)
 
-        self.server.node.virtual_disk[filename] = self.session_state["total_received_size"]
+        self.server.node.virtual_disk[self.session_state["current_filename"]] = self.session_state["expected_chunk_size"] * self.session_state["expected_chunks"]
         self.server.node._save_disk()
         print(f"Received chunk {chunk_number}/{self.session_state['expected_chunks']} for {filename}: {self.session_state['total_received_size']} bytes total")
 
         if self.session_state["received_chunks"] == self.session_state["expected_chunks"]:
-            os.rename(self.session_state["temp_file_path"], final_path)
+            self.safe_rename(self.session_state["temp_file_path"], final_path)
             print(f"Completed receiving {filename}: {self.session_state['total_received_size']} bytes")
             self.session_state = {
                 "current_filename": None,
