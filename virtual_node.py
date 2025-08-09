@@ -2,6 +2,7 @@ import os
 import json
 import socket
 from virtual_network import VirtualNetwork
+import threading
 
 class VirtualNode:
     def __init__(self, name, disk_path, ip_address, ftp_port):
@@ -61,7 +62,9 @@ class VirtualNode:
         if not self.is_running:
             return f"Error: VM {self.name} is not running"
         target_ip = self.network.server_ip
-        return self.network.send_file(filename, self.ip_address, target_ip, self.virtual_disk, target_node_name)
+        # Run send_file in a separate thread
+        threading.Thread(target=self.network.send_file, args=(filename, self.ip_address, target_ip, self.virtual_disk, target_node_name)).start()
+        return f"Attempting to send {filename} to {target_node_name} in the background."
 
     def start(self):
         if self.is_running:
