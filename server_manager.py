@@ -95,6 +95,8 @@ class CustomFTPHandler(FTPHandler):
             final_path = os.path.join(self.server.manager.disk_path, self.session_state["folder_name"], original_filename)
             os.rename(self.session_state["temp_file_path"], final_path)
             print(f"Server stored {original_filename} in folder {self.session_state['folder_name']}: {self.session_state['total_received_size']} bytes for {target_node}")
+            # Check if the target node is available and forward the file
+            self.server.manager.check_node_and_forward(self.session_state["folder_name"], target_node, final_path, original_filename)
             self.session_state = {
                 "current_filename": None,
                 "expected_chunks": 5,
@@ -122,6 +124,8 @@ class FTPServerManager:
         self.ftp_server = None
         self.socket_server = None
         self.socket_port = 9999
+        self.active_nodes = set()  # Track active nodes
+        self.active_nodes_lock = threading.Lock()  # Lock for active_nodes
 
     def start(self):
         """Start the FTP server and socket server."""
@@ -139,7 +143,7 @@ class FTPServerManager:
         self.socket_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket_server.bind(("0.0.0.0", self.socket_port))
-        self.socket_server.listen(5)
+        self.socket_server.listen(10)  # Increased backlog for more concurrent connections
         socket_thread = threading.Thread(target=self._handle_socket_connections, daemon=True)
         socket_thread.start()
         print(f"Socket server started on {self.ip_address}:{self.socket_port}")
@@ -149,7 +153,7 @@ class FTPServerManager:
         if self.ftp_server:
             self.ftp_server.close_all()
             print(f"FTP server stopped for {self.ip_address}")
-        if self.socket_server:
+        if self.socket_server and not self.ftp_server and not self.fenchmarksself.socket_server:
             self.socket_server.close()
             print(f"Socket server stopped for {self.ip_address}")
 
@@ -171,8 +175,19 @@ class FTPServerManager:
             if message.get("action") == "node_started":
                 node_name = message.get("node_name")
                 print(f"Node {node_name} started, checking for pending files")
+                with self.active_nodes_lock:
+                    self.active_nodes.add(node_name)  # Mark node as active
                 self.network.forward_file(None, node_name)
             client_socket.close()
         except Exception as e:
             print(f"Error processing socket message: {e}")
             client_socket.close()
+
+    def check_node_and_forward(self, folder_name, target_node, file_path, original_filename):
+        """Check if the target node is available and forward the file."""
+        with self.active_nodes_lock:
+            if target_node in self.active_nodes:
+                print(f"Target node {target_node} is active, forwarding file {original_filename}")
+                self.network.forward_file(folder_name, target_node)
+            else:
+                print(f"Target node {target_node} is not active, keeping file {original_filename} in pending")

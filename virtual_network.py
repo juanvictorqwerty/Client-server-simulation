@@ -68,7 +68,7 @@ class CustomFTPHandler(FTPHandler):
                 print(f"Error: Chunk {chunk_number} size {chunk_size} does not match expected {self.session_state['expected_chunk_size']}")
                 return
             self.session_state["received_chunks"] += 1
-            self.session_state["total_received_size"] += actual_payload_size
+            self.session_state["total_received_size"] = actual_payload_size
             with open(self.session_state["temp_file_path"], 'ab') as f:
                 f.write(payload)
 
@@ -103,11 +103,12 @@ class VirtualNetwork:
         }
         self.ftp_servers = {}
         self.num_chunks = 5
-        self.bandwidth_bytes_per_sec = 100 * 1024 * 1024 // 8  # 100 Mb/s = 12.5 MB/s
+        self.bandwidth_bytes_per_sec = 125_000_000  # 1 Gb/s = 1,000,000,000 bits/s = 125,000,000 bytes/s
         self.header_size = 32
         self.server_ip = "127.0.0.1"
         self.server_port = 2120
         self.server_disk_path = "./assets/server/"
+        self.transfer_semaphore = threading.Semaphore(10)  # Limit to 10 concurrent transfers
 
     def start_ftp_server(self, node, ip_address, ftp_port, disk_path):
         """Start an FTP server for a node."""
@@ -173,88 +174,35 @@ class VirtualNetwork:
 
     def send_file(self, filename, source_ip, target_ip, virtual_disk, target_node_name=None):
         """Send a file to another node's disk or server using FTP."""
-        if target_ip not in self.ip_map and target_ip != self.server_ip:
-            return f"Error: Target IP {target_ip} not found"
-        if source_ip == target_ip:
-            return f"Error: Cannot send file to self"
-        if filename not in virtual_disk:
-            return f"Error: File {filename} does not exist"
+        with self.transfer_semaphore:
+            if target_ip not in self.ip_map and target_ip != self.server_ip:
+                return f"Error: Target IP {target_ip} not found"
+            if source_ip == target_ip:
+                return f"Error: Cannot send file to self"
+            if filename not in virtual_disk:
+                return f"Error: File {filename} does not exist"
 
-        size = virtual_disk[filename]
-        total_storage = 1024 * 1024 * 1024 if target_ip != self.server_ip else float('inf')
-        can_store, error = self.check_target_storage(target_ip, size, total_storage)
-        if not can_store:
-            return error
+            size = virtual_disk[filename]
+            total_storage = 1024 * 1024 * 1024 if target_ip != self.server_ip else float('inf')
+            can_store, error = self.check_target_storage(target_ip, size, total_storage)
+            if not can_store:
+                return error
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            temp_file.write(b"\0" * size)
-            temp_file_path = temp_file.name
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_file.write(b"\0" * size)
+                temp_file_path = temp_file.name
 
-        try:
-            ftp = ftplib.FTP()
-            ftp.connect(host="127.0.0.1", port=self.ip_map.get(target_ip, {"ftp_port": self.server_port})["ftp_port"])
-            ftp.login(user="user", passwd="password")
-            start_time = time.time()
-            print(f"Transfer started at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
-
-            chunk_size = math.ceil(size / self.num_chunks)
-            sent_bytes = 0
-            chunk_count = 0
-            with open(temp_file_path, 'rb') as f:
-                while chunk_count < self.num_chunks and sent_bytes < size:
-                    chunk_count += 1
-                    remaining_bytes = size - sent_bytes
-                    current_chunk_size = min(chunk_size, remaining_bytes)
-                    chunk = f.read(current_chunk_size)
-                    if not chunk:
-                        break
-                    header = f"CHUNK:{chunk_count}:{current_chunk_size}" + (f":{target_node_name}" if target_node_name else "") + "\n"
-                    header = header.encode().ljust(self.header_size, b'\0')
-                    chunk_with_header = header + chunk
-                    with tempfile.NamedTemporaryFile(delete=False) as chunk_file:
-                        chunk_file.write(chunk_with_header)
-                        chunk_file_path = chunk_file.name
-                    chunk_start_time = time.time()
-                    with open(chunk_file_path, 'rb') as cf:
-                        mode = 'STOR' if chunk_count == 1 else 'APPE'
-                        ftp.storbinary(f"{mode} {filename}", cf)
-                    os.unlink(chunk_file_path)
-                    sent_bytes += current_chunk_size
-                    elapsed_time = time.time() - chunk_start_time
-                    expected_time = (current_chunk_size + self.header_size) / self.bandwidth_bytes_per_sec
-                    sleep_time = max(0, expected_time - elapsed_time)
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-                    total_time = time.time() - chunk_start_time
-                    print(f"Sent chunk {chunk_count}/5 ({current_chunk_size} bytes) for {filename} to {target_ip} in {total_time:.2f} seconds")
-
-            end_time = time.time()
-            ftp.quit()
-            os.unlink(temp_file_path)
-            print(f"Transfer ended at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
-            print(f"Transferred {filename}: {size} bytes ({size / (1024 * 1024):.2f} MB)")
-            print(f"Completed sending {filename} ({size} bytes) in {chunk_count} chunks to {target_ip}")
-            return f"Sent {filename} ({size} bytes) to {target_ip}"
-        except Exception as e:
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
-            return f"Error sending file to {target_ip}: {e}"
-
-    def forward_file(self, filename, target_node_name):
-        """Forward pending files to the target node in a separate thread."""
-        def forward_task(folder_name, target_ip, file_path, size, original_filename):
             try:
-                target_filename = self._get_unique_filename(original_filename, target_ip)
                 ftp = ftplib.FTP()
-                ftp.connect(host="127.0.0.1", port=self.ip_map[target_ip]["ftp_port"])
+                ftp.connect(host="127.0.0.1", port=self.ip_map.get(target_ip, {"ftp_port": self.server_port})["ftp_port"])
                 ftp.login(user="user", passwd="password")
                 start_time = time.time()
-                print(f"Forwarding started at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
+                print(f"Transfer started at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
 
                 chunk_size = math.ceil(size / self.num_chunks)
                 sent_bytes = 0
                 chunk_count = 0
-                with open(file_path, 'rb') as f:
+                with open(temp_file_path, 'rb') as f:
                     while chunk_count < self.num_chunks and sent_bytes < size:
                         chunk_count += 1
                         remaining_bytes = size - sent_bytes
@@ -262,7 +210,8 @@ class VirtualNetwork:
                         chunk = f.read(current_chunk_size)
                         if not chunk:
                             break
-                        header = f"CHUNK:{chunk_count}:{current_chunk_size}\n".encode().ljust(self.header_size, b'\0')
+                        header = f"CHUNK:{chunk_count}:{current_chunk_size}" + (f":{target_node_name}" if target_node_name else "") + "\n"
+                        header = header.encode().ljust(self.header_size, b'\0')
                         chunk_with_header = header + chunk
                         with tempfile.NamedTemporaryFile(delete=False) as chunk_file:
                             chunk_file.write(chunk_with_header)
@@ -270,7 +219,7 @@ class VirtualNetwork:
                         chunk_start_time = time.time()
                         with open(chunk_file_path, 'rb') as cf:
                             mode = 'STOR' if chunk_count == 1 else 'APPE'
-                            ftp.storbinary(f"{mode} {target_filename}", cf)
+                            ftp.storbinary(f"{mode} {filename}", cf)
                         os.unlink(chunk_file_path)
                         sent_bytes += current_chunk_size
                         elapsed_time = time.time() - chunk_start_time
@@ -279,20 +228,74 @@ class VirtualNetwork:
                         if sleep_time > 0:
                             time.sleep(sleep_time)
                         total_time = time.time() - chunk_start_time
-                        print(f"Forwarded chunk {chunk_count}/5 ({current_chunk_size} bytes) for {original_filename} as {target_filename} to {target_ip} in {total_time:.2f} seconds")
+                        print(f"Sent chunk {chunk_count}/5 ({current_chunk_size} bytes) for {filename} to {target_ip} in {total_time:.2f} seconds")
 
                 end_time = time.time()
                 ftp.quit()
-                with self.manager.pending_files_lock:
-                    if folder_name in self.manager.pending_files:
-                        del self.manager.pending_files[folder_name]
-                shutil.rmtree(os.path.dirname(file_path))
-                print(f"Deleted folder {folder_name} from server after forwarding")
-                print(f"Forwarding ended at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
-                print(f"Forwarded {original_filename} as {target_filename}: {size} bytes ({size / (1024 * 1024):.2f} MB)")
-                print(f"Completed forwarding {original_filename} ({size} bytes) in {chunk_count} chunks to {target_ip}")
+                os.unlink(temp_file_path)
+                print(f"Transfer ended at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
+                print(f"Transferred {filename}: {size} bytes ({size / (1024 * 1024):.2f} MB)")
+                print(f"Completed sending {filename} ({size} bytes) in {chunk_count} chunks to {target_ip}")
+                return f"Sent {filename} ({size} bytes) to {target_ip}"
             except Exception as e:
-                print(f"Error forwarding file {original_filename} to {target_ip}: {e}")
+                if os.path.exists(temp_file_path):
+                    os.unlink(temp_file_path)
+                return f"Error sending file to {target_ip}: {e}"
+
+    def forward_file(self, folder_name, target_node_name):
+        """Forward pending files to the target node in a separate thread."""
+        def forward_task(folder_name, target_ip, file_path, size, original_filename):
+            with self.transfer_semaphore:
+                try:
+                    target_filename = self._get_unique_filename(original_filename, target_ip)
+                    ftp = ftplib.FTP()
+                    ftp.connect(host="127.0.0.1", port=self.ip_map[target_ip]["ftp_port"])
+                    ftp.login(user="user", passwd="password")
+                    start_time = time.time()
+                    print(f"Forwarding started at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
+
+                    chunk_size = math.ceil(size / self.num_chunks)
+                    sent_bytes = 0
+                    chunk_count = 0
+                    with open(file_path, 'rb') as f:
+                        while chunk_count < self.num_chunks and sent_bytes < size:
+                            chunk_count += 1
+                            remaining_bytes = size - sent_bytes
+                            current_chunk_size = min(chunk_size, remaining_bytes)
+                            chunk = f.read(current_chunk_size)
+                            if not chunk:
+                                break
+                            header = f"CHUNK:{chunk_count}:{current_chunk_size}\n".encode().ljust(self.header_size, b'\0')
+                            chunk_with_header = header + chunk
+                            with tempfile.NamedTemporaryFile(delete=False) as chunk_file:
+                                chunk_file.write(chunk_with_header)
+                                chunk_file_path = chunk_file.name
+                            chunk_start_time = time.time()
+                            with open(chunk_file_path, 'rb') as cf:
+                                mode = 'STOR' if chunk_count == 1 else 'APPE'
+                                ftp.storbinary(f"{mode} {target_filename}", cf)
+                            os.unlink(chunk_file_path)
+                            sent_bytes += current_chunk_size
+                            elapsed_time = time.time() - chunk_start_time
+                            expected_time = (current_chunk_size + self.header_size) / self.bandwidth_bytes_per_sec
+                            sleep_time = max(0, expected_time - elapsed_time)
+                            if sleep_time > 0:
+                                time.sleep(sleep_time)
+                            total_time = time.time() - chunk_start_time
+                            print(f"Forwarded chunk {chunk_count}/5 ({current_chunk_size} bytes) for {original_filename} as {target_filename} to {target_ip} in {total_time:.2f} seconds")
+
+                    end_time = time.time()
+                    ftp.quit()
+                    with self.manager.pending_files_lock:
+                        if folder_name in self.manager.pending_files:
+                            del self.manager.pending_files[folder_name]
+                    shutil.rmtree(os.path.dirname(file_path))
+                    print(f"Deleted folder {folder_name} from server after forwarding")
+                    print(f"Forwarding ended at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}")
+                    print(f"Forwarded {original_filename} as {target_filename}: {size} bytes ({size / (1024 * 1024):.2f} MB)")
+                    print(f"Completed forwarding {original_filename} ({size} bytes) in {chunk_count} chunks to {target_ip}")
+                except Exception as e:
+                    print(f"Error forwarding file {original_filename} to {target_ip}: {e}")
 
         target_ip = None
         for ip, info in self.ip_map.items():
@@ -305,16 +308,16 @@ class VirtualNetwork:
 
         files_to_forward = []
         with self.manager.pending_files_lock:
-            for folder_name, (tname, fname) in list(self.manager.pending_files.items()):
+            for fname, (tname, fname_orig) in list(self.manager.pending_files.items()):
                 if tname == target_node_name:
-                    file_path = os.path.join(self.server_disk_path, folder_name, fname)
+                    file_path = os.path.join(self.server_disk_path, fname, fname_orig)
                     if os.path.exists(file_path):
                         size = os.path.getsize(file_path)
                         can_store, error = self.check_target_storage(target_ip, size, 1024 * 1024 * 1024)
                         if can_store:
-                            files_to_forward.append((folder_name, file_path, size, fname))
+                            files_to_forward.append((fname, file_path, size, fname_orig))
                         else:
                             print(error)
 
-        for folder_name, file_path, size, fname in files_to_forward:
-            threading.Thread(target=forward_task, args=(folder_name, target_ip, file_path, size, fname), daemon=True).start()
+        for fname, file_path, size, fname_orig in files_to_forward:
+            threading.Thread(target=forward_task, args=(fname, target_ip, file_path, size, fname_orig), daemon=True).start()
