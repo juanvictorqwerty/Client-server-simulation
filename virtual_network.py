@@ -9,110 +9,20 @@ import math
 import time
 import re
 import shutil
-
-class CustomFTPHandler(FTPHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.session_state = {
-            "current_filename": None,
-            "expected_chunks": 5,
-            "received_chunks": 0,
-            "total_received_size": 0,
-            "temp_file_path": None,
-            "expected_chunk_size": None
-        }
-
-    def safe_rename(self, src, dst):
-        """Rename src -> dst, deleting dst if it already exists."""
-        if os.path.exists(dst):
-            os.remove(dst)
-        os.rename(src, dst)
-
-    def on_file_received(self, file_path):
-        """Handle chunk reception for nodes."""
-        if file_path.endswith("disk_metadata.json"):
-            return
-
-        with open(file_path, 'rb') as f:
-            data = f.read()
-
-        header_pattern = re.compile(b"CHUNK:(\d+):(\d+)\n")
-        match = header_pattern.match(data)
-        if not match:
-            print(f"Error: Invalid chunk header in {file_path}")
-            return
-
-        chunk_number = int(match.group(1))
-        chunk_size = int(match.group(2))
-        header_end = match.end()
-        payload = data[header_end:header_end + chunk_size]
-        actual_payload_size = len(payload)
-
-        if actual_payload_size != chunk_size:
-            print(f"Error: Chunk {chunk_number} size mismatch, expected {chunk_size}, got {actual_payload_size}")
-            return
-
-        filename = os.path.basename(file_path)
-        final_path = os.path.join(os.path.dirname(file_path), self.session_state["current_filename"] if self.session_state["current_filename"] else filename)
-
-        if chunk_number == 1:
-            self.session_state["current_filename"] = filename
-            self.session_state["received_chunks"] = 1
-            self.session_state["total_received_size"] = actual_payload_size
-            self.session_state["temp_file_path"] = tempfile.NamedTemporaryFile(delete=False, dir=os.path.dirname(file_path)).name
-            self.session_state["expected_chunk_size"] = chunk_size
-            with open(self.session_state["temp_file_path"], 'wb') as f:
-                f.write(payload)
-        else:
-            if filename != self.session_state["current_filename"]:
-                print(f"Error: Chunk {chunk_number} for {filename} does not match expected file {self.session_state['current_filename']}")
-                return
-            if chunk_number != self.session_state["received_chunks"] + 1:
-                print(f"Error: Received chunk {chunk_number} out of order, expected {self.session_state['received_chunks'] + 1}")
-                return
-            if chunk_size != self.session_state["expected_chunk_size"]:
-                print(f"Error: Chunk {chunk_number} size {chunk_size} does not match expected {self.session_state['expected_chunk_size']}")
-                return
-            self.session_state["received_chunks"] += 1
-            self.session_state["total_received_size"] = actual_payload_size
-            with open(self.session_state["temp_file_path"], 'ab') as f:
-                f.write(payload)
-
-        self.server.node.virtual_disk[self.session_state["current_filename"]] = self.session_state["expected_chunk_size"] * self.session_state["expected_chunks"]
-        self.server.node._save_disk()
-        print(f"Received chunk {chunk_number}/{self.session_state['expected_chunks']} for {filename}: {self.session_state['total_received_size']} bytes total")
-
-        if self.session_state["received_chunks"] == self.session_state["expected_chunks"]:
-            self.safe_rename(self.session_state["temp_file_path"], final_path)
-            print(f"Completed receiving {filename}: {self.session_state['total_received_size']} bytes")
-            self.session_state = {
-                "current_filename": None,
-                "expected_chunks": 5,
-                "received_chunks": 0,
-                "total_received_size": 0,
-                "temp_file_path": None,
-                "expected_chunk_size": None
-            }
-
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
+from node_ftp_handler import NodeFTPHandler # This import is not used in this file
+from config import IP_MAP, SERVER_IP, SERVER_SOCKET_PORT, SERVER_FTP_PORT
 
 class VirtualNetwork:
     def __init__(self, manager=None):
         self.manager = manager
-        self.ip_map = {
-            "192.168.1.1": {"disk_path": "./assets/node1/", "ftp_port": 2121, "node_name": "node1"},
-            "192.168.1.2": {"disk_path": "./assets/node2/", "ftp_port": 2122, "node_name": "node2"},
-            "192.168.1.3": {"disk_path": "./assets/node3/", "ftp_port": 2123, "node_name": "node3"}
-        }
+        self.ip_map = IP_MAP
         self.ftp_servers = {}
         self.num_chunks = 5
         self.bandwidth_bytes_per_sec = 125_000_000  # 1 Gb/s = 1,000,000,000 bits/s = 125,000,000 bytes/s
         self.header_size = 32
-        self.server_ip = "127.0.0.1"
-        self.server_port = 2120
+        self.server_ip = SERVER_IP
+        self.server_port = SERVER_SOCKET_PORT
+        self.server_ftp_port = SERVER_FTP_PORT
         self.server_disk_path = "./assets/server/"
         self.transfer_semaphore = threading.Semaphore(10)  # Limit to 10 concurrent transfers
 
@@ -120,7 +30,7 @@ class VirtualNetwork:
         """Start an FTP server for a node."""
         authorizer = DummyAuthorizer()
         authorizer.add_user("user", "password", disk_path, perm="elradfmw")
-        handler = CustomFTPHandler
+        handler = NodeFTPHandler  # Use the node FTPHandler
         handler.authorizer = authorizer
         ftp_server = FTPServer(("0.0.0.0", ftp_port), handler)
         ftp_server.node = node
@@ -142,7 +52,7 @@ class VirtualNetwork:
             return False, f"Error: Target IP {target_ip} not found"
         try:
             ftp = ftplib.FTP()
-            ftp.connect(host="127.0.0.1", port=self.ip_map.get(target_ip, {"ftp_port": self.server_port})["ftp_port"])
+            ftp.connect(host="127.0.0.1", port=self.ip_map.get(target_ip, {"ftp_port": self.server_ftp_port})["ftp_port"])
             ftp.login(user="user", passwd="password")
             files = []
             ftp.dir(lambda x: files.append(x))
@@ -227,7 +137,12 @@ class VirtualNetwork:
                 return f"Error: File {filename} does not exist"
 
             size = virtual_disk[filename]
-            total_storage = 1024 * 1024 * 1024 if target_ip != self.server_ip else float('inf')
+            if target_ip == self.server_ip:
+                total, used, free = shutil.disk_usage(self.server_disk_path)
+                total_storage = total
+            else:
+                total_storage = 1024 * 1024 * 1024  # 1 GB for nodes
+
             can_store, error = self.check_target_storage(target_ip, size, total_storage)
             if not can_store:
                 return error
@@ -238,7 +153,7 @@ class VirtualNetwork:
 
             try:
                 ftp = ftplib.FTP()
-                ftp.connect(host="127.0.0.1", port=self.ip_map.get(target_ip, {"ftp_port": self.server_port})["ftp_port"])
+                ftp.connect(host="127.0.0.1", port=self.ip_map.get(target_ip, {"ftp_port": self.server_ftp_port})["ftp_port"])
                 ftp.login(user="user", passwd="password")
                 self._execute_chunked_transfer(ftp, temp_file_path, size, filename, target_node_name)
                 ftp.quit()
@@ -248,7 +163,8 @@ class VirtualNetwork:
                 if os.path.exists(temp_file_path):
                     os.unlink(temp_file_path)
                 return f"Error sending file to {target_ip}: {e}"
-
+    
+    #used by the server to forward files to nodes
     def forward_file(self, folder_name, target_node_name):
         """Forward pending files to the target node in a separate thread."""
         def forward_task(folder_name, target_ip, file_path, size, original_filename):
@@ -269,7 +185,7 @@ class VirtualNetwork:
                     print(f"Deleted folder {folder_name} from server after forwarding")
                 except Exception as e:
                     print(f"Error forwarding file {original_filename} to {target_ip}: {e}")
-
+        
         target_ip = None
         for ip, info in self.ip_map.items():
             if info["node_name"] == target_node_name:
@@ -285,7 +201,7 @@ class VirtualNetwork:
                 if tname == target_node_name:
                     file_path = os.path.join(self.server_disk_path, fname, fname_orig)
                     if os.path.exists(file_path):
-                        size = os.path.getsize(file_path)
+                        size = os.path.getsize(file_path) # Assuming the file exists and its size is needed for storage check
                         can_store, error = self.check_target_storage(target_ip, size, 1024 * 1024 * 1024)
                         if can_store:
                             files_to_forward.append((fname, file_path, size, fname_orig))

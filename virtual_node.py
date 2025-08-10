@@ -3,6 +3,7 @@ import json
 import socket
 from virtual_network import VirtualNetwork
 import threading
+from config import  IP_MAP , SERVER_IP, SERVER_SOCKET_PORT
 
 class VirtualNode:
     def __init__(self, name, disk_path, ip_address, ftp_port):
@@ -14,11 +15,7 @@ class VirtualNode:
         self.virtual_disk = {}
         self.memory = {}
         self.is_running = False
-        self.ip_map = {
-            "192.168.1.1": {"disk_path": "./assets/node1/", "ftp_port": 2121, "node_name": "node1"},
-            "192.168.1.2": {"disk_path": "./assets/node2/", "ftp_port": 2122, "node_name": "node2"},
-            "192.168.1.3": {"disk_path": "./assets/node3/", "ftp_port": 2123, "node_name": "node3"}
-        }
+        self.ip_map = IP_MAP
         self.network = VirtualNetwork()
         self._initialize_disk()
         self.network.start_ftp_server(self, ip_address, ftp_port, disk_path)
@@ -61,9 +58,18 @@ class VirtualNode:
     def send(self, filename, target_node_name):
         if not self.is_running:
             return f"Error: VM {self.name} is not running"
+        
+        if not any(node_info['node_name'] == target_node_name for node_info in self.ip_map.values()):
+            return f"Error: Target node '{target_node_name}' does not exist."
+
         target_ip = self.network.server_ip
-        # Run send_file in a separate thread
-        threading.Thread(target=self.network.send_file, args=(filename, self.ip_address, target_ip, self.virtual_disk, target_node_name)).start()
+        def send_task():
+            try:
+                result = self.network.send_file(filename, self.ip_address, target_ip, self.virtual_disk, target_node_name)
+                print(f"Send result: {result}")
+            except Exception as e:
+                print(f"Error in send_file thread: {e}")
+        threading.Thread(target=send_task, args=()).start()
         return f"Attempting to send {filename} to {target_node_name} in the background."
 
     def start(self):
@@ -73,7 +79,7 @@ class VirtualNode:
         # Notify server via socket
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect(("127.0.0.1", 9999))
+            sock.connect((SERVER_IP, SERVER_SOCKET_PORT))
             message = json.dumps({"action": "node_started", "node_name": self.name})
             sock.send(message.encode())
             sock.close()

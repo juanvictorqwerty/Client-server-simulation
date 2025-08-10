@@ -1,10 +1,11 @@
 import os
 from server_manager import FTPServerManager
+from config import SERVER_DISK_PATH
 
 if __name__ == "__main__":
-    server_disk_path = "./assets/server/"
+    server_disk_path = SERVER_DISK_PATH
     os.makedirs(server_disk_path, exist_ok=True)
-    server = FTPServerManager("127.0.0.1", 2120, server_disk_path)
+    server = FTPServerManager()
     server.start()
     print("Server running. Press Ctrl+C to stop.")
     try:

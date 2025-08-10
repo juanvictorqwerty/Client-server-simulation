@@ -6,127 +6,22 @@ from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
 from virtual_network import VirtualNetwork
-import os
-import re
-import tempfile
-import shutil
-
-class CustomFTPHandler(FTPHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.session_state = {
-            "current_filename": None,
-            "expected_chunks": 5,
-            "received_chunks": 0,
-            "total_received_size": 0,
-            "target_node": None,
-            "temp_file_path": None,
-            "expected_chunk_size": None,
-            "folder_name": None
-        }
-
-    def _get_unique_folder_name(self):
-        """Generate a unique folder name (e.g., file_001)."""
-        counter = 1
-        while True:
-            folder_name = f"file_{counter:03d}"
-            folder_path = os.path.join(self.server.manager.disk_path, folder_name)
-            with self.server.manager.pending_files_lock:
-                if not os.path.exists(folder_path) and folder_name not in self.server.manager.pending_files:
-                    return folder_name
-            counter += 1
-
-    def on_file_received(self, file_path):
-        """Handle chunk reception for the server."""
-        with open(file_path, 'rb') as f:
-            data = f.read()
-
-        header_pattern = re.compile(b"CHUNK:(\d+):(\d+):([^\n]+)\n")
-        match = header_pattern.match(data)
-        if not match:
-            self.server.manager.logger.error(f"Invalid chunk header in {file_path}")
-            return
-
-        chunk_number = int(match.group(1))
-        chunk_size = int(match.group(2))
-        target_node = match.group(3).decode()
-        header_end = match.end()
-        payload = data[header_end:header_end + chunk_size]
-        actual_payload_size = len(payload)
-
-        if actual_payload_size != chunk_size:
-            self.server.manager.logger.error(f"Chunk {chunk_number} size mismatch, expected {chunk_number}, got {actual_payload_size}")
-            return
-
-        original_filename = os.path.basename(file_path)
-
-        if chunk_number == 1:
-            folder_name = self._get_unique_folder_name()
-            folder_path = os.path.join(self.server.manager.disk_path, folder_name)
-            os.makedirs(folder_path, exist_ok=True)
-            self.session_state["current_filename"] = original_filename
-            self.session_state["received_chunks"] = 1
-            self.session_state["total_received_size"] = actual_payload_size
-            self.session_state["target_node"] = target_node
-            self.session_state["folder_name"] = folder_name
-            self.session_state["temp_file_path"] = tempfile.NamedTemporaryFile(delete=False, dir=folder_path).name
-            self.session_state["expected_chunk_size"] = chunk_size
-            with open(self.session_state["temp_file_path"], 'wb') as f:
-                f.write(payload)
-            with self.server.manager.pending_files_lock:
-                self.server.manager.pending_files[folder_name] = (target_node, original_filename)
-        else:
-            if original_filename != self.session_state["current_filename"] or target_node != self.session_state["target_node"]:
-                self.server.manager.logger.error(f"Chunk {chunk_number} for {original_filename}:{target_node} does not match expected {self.session_state['current_filename']}:{self.session_state['target_node']}")
-                return
-            if chunk_number != self.session_state["received_chunks"] + 1:
-                self.server.manager.logger.error(f"Received chunk {chunk_number} out of order, expected {self.session_state['received_chunks'] + 1}")
-                return
-            if chunk_size != self.session_state["expected_chunk_size"]:
-                self.server.manager.logger.error(f"Chunk {chunk_number} size {chunk_size} does not match expected {self.session_state['expected_chunk_size']}")
-                return
-            self.session_state["received_chunks"] += 1
-            self.session_state["total_received_size"] += actual_payload_size
-            with open(self.session_state["temp_file_path"], 'ab') as f:
-                f.write(payload)
-
-        self.server.manager.logger.info(f"Received chunk {chunk_number}/{self.session_state['expected_chunks']} for {original_filename} (folder: {self.session_state['folder_name']}, target: {target_node}): {self.session_state['total_received_size']} bytes total")
-
-        if self.session_state["received_chunks"] == self.session_state["expected_chunks"]:
-            final_path = os.path.join(self.server.manager.disk_path, self.session_state["folder_name"], original_filename)
-            os.rename(self.session_state["temp_file_path"], final_path)
-            self.server.manager.logger.info(f"Stored {original_filename} in folder {self.session_state['folder_name']}: {self.session_state['total_received_size']} bytes for {target_node}")
-            # Check if the target node is available and forward the file
-            self.server.manager.check_node_and_forward(self.session_state["folder_name"], target_node, final_path, original_filename)
-            self.session_state = {
-                "current_filename": None,
-                "expected_chunks": 5,
-                "received_chunks": 0,
-                "total_received_size": 0,
-                "target_node": None,
-                "temp_file_path": None,
-                "expected_chunk_size": None,
-                "folder_name": None
-            }
-
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
+from server_ftp_handler import ServerFTPHandler
+from config import SERVER_IP, SERVER_FTP_PORT, SERVER_SOCKET_PORT, SERVER_DISK_PATH
 
 class FTPServerManager:
-    def __init__(self, ip_address, ftp_port, disk_path):
-        self.ip_address = ip_address
-        self.ftp_port = ftp_port
-        self.disk_path = disk_path
+    def __init__(self):
+        self.ip_address = SERVER_IP
+        self.ftp_port = SERVER_FTP_PORT
+        self.disk_path = SERVER_DISK_PATH
         self.network = VirtualNetwork(self)
-        self.pending_files = {}  # folder_name: (target_node_name, original_filename)
+        self.pending_files = {}
         self.pending_files_lock = threading.Lock()
         self.ftp_server = None
         self.socket_server = None
-        self.socket_port = 9999
-        self.active_nodes = set()  # Track active nodes
-        self.active_nodes_lock = threading.Lock()  # Lock for active_nodes
+        self.socket_port = SERVER_SOCKET_PORT
+        self.active_nodes = set()
+        self.active_nodes_lock = threading.Lock()
         self.logger = None
         self._setup_logging()
 
@@ -145,7 +40,7 @@ class FTPServerManager:
         """Start the FTP server and socket server."""
         authorizer = DummyAuthorizer()
         authorizer.add_user("user", "password", self.disk_path, perm="elradfmw")
-        handler = CustomFTPHandler  # Use CustomFTPHandler for concurrent requests
+        handler = ServerFTPHandler  # Use the server handler
         handler.authorizer = authorizer
         self.ftp_server = FTPServer(("0.0.0.0", self.ftp_port), handler)
         self.ftp_server.node = None
