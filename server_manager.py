@@ -1,5 +1,6 @@
 import threading
 import socket
+import logging
 import json
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
@@ -43,7 +44,7 @@ class CustomFTPHandler(FTPHandler):
         header_pattern = re.compile(b"CHUNK:(\d+):(\d+):([^\n]+)\n")
         match = header_pattern.match(data)
         if not match:
-            print(f"Error: Invalid chunk header in {file_path}")
+            self.server.manager.logger.error(f"Invalid chunk header in {file_path}")
             return
 
         chunk_number = int(match.group(1))
@@ -54,7 +55,7 @@ class CustomFTPHandler(FTPHandler):
         actual_payload_size = len(payload)
 
         if actual_payload_size != chunk_size:
-            print(f"Error: Chunk {chunk_number} size mismatch, expected {chunk_size}, got {actual_payload_size}")
+            self.server.manager.logger.error(f"Chunk {chunk_number} size mismatch, expected {chunk_number}, got {actual_payload_size}")
             return
 
         original_filename = os.path.basename(file_path)
@@ -76,25 +77,25 @@ class CustomFTPHandler(FTPHandler):
                 self.server.manager.pending_files[folder_name] = (target_node, original_filename)
         else:
             if original_filename != self.session_state["current_filename"] or target_node != self.session_state["target_node"]:
-                print(f"Error: Chunk {chunk_number} for {original_filename}:{target_node} does not match expected {self.session_state['current_filename']}:{self.session_state['target_node']}")
+                self.server.manager.logger.error(f"Chunk {chunk_number} for {original_filename}:{target_node} does not match expected {self.session_state['current_filename']}:{self.session_state['target_node']}")
                 return
             if chunk_number != self.session_state["received_chunks"] + 1:
-                print(f"Error: Received chunk {chunk_number} out of order, expected {self.session_state['received_chunks'] + 1}")
+                self.server.manager.logger.error(f"Received chunk {chunk_number} out of order, expected {self.session_state['received_chunks'] + 1}")
                 return
             if chunk_size != self.session_state["expected_chunk_size"]:
-                print(f"Error: Chunk {chunk_number} size {chunk_size} does not match expected {self.session_state['expected_chunk_size']}")
+                self.server.manager.logger.error(f"Chunk {chunk_number} size {chunk_size} does not match expected {self.session_state['expected_chunk_size']}")
                 return
             self.session_state["received_chunks"] += 1
             self.session_state["total_received_size"] += actual_payload_size
             with open(self.session_state["temp_file_path"], 'ab') as f:
                 f.write(payload)
 
-        print(f"Server received chunk {chunk_number}/{self.session_state['expected_chunks']} for {original_filename} (folder: {self.session_state['folder_name']}, target: {target_node}): {self.session_state['total_received_size']} bytes total")
+        self.server.manager.logger.info(f"Received chunk {chunk_number}/{self.session_state['expected_chunks']} for {original_filename} (folder: {self.session_state['folder_name']}, target: {target_node}): {self.session_state['total_received_size']} bytes total")
 
         if self.session_state["received_chunks"] == self.session_state["expected_chunks"]:
             final_path = os.path.join(self.server.manager.disk_path, self.session_state["folder_name"], original_filename)
             os.rename(self.session_state["temp_file_path"], final_path)
-            print(f"Server stored {original_filename} in folder {self.session_state['folder_name']}: {self.session_state['total_received_size']} bytes for {target_node}")
+            self.server.manager.logger.info(f"Stored {original_filename} in folder {self.session_state['folder_name']}: {self.session_state['total_received_size']} bytes for {target_node}")
             # Check if the target node is available and forward the file
             self.server.manager.check_node_and_forward(self.session_state["folder_name"], target_node, final_path, original_filename)
             self.session_state = {
@@ -126,12 +127,25 @@ class FTPServerManager:
         self.socket_port = 9999
         self.active_nodes = set()  # Track active nodes
         self.active_nodes_lock = threading.Lock()  # Lock for active_nodes
+        self.logger = None
+        self._setup_logging()
+
+    def _setup_logging(self):
+        """Sets up centralized logging for the server."""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler("server.log"),
+                logging.StreamHandler()
+            ])
+        self.logger = logging.getLogger("FTPServerManager")
 
     def start(self):
         """Start the FTP server and socket server."""
         authorizer = DummyAuthorizer()
         authorizer.add_user("user", "password", self.disk_path, perm="elradfmw")
-        handler = CustomFTPHandler
+        handler = CustomFTPHandler  # Use CustomFTPHandler for concurrent requests
         handler.authorizer = authorizer
         self.ftp_server = FTPServer(("0.0.0.0", self.ftp_port), handler)
         self.ftp_server.node = None
@@ -152,10 +166,10 @@ class FTPServerManager:
         """Stop the FTP server and socket server."""
         if self.ftp_server:
             self.ftp_server.close_all()
-            print(f"FTP server stopped for {self.ip_address}")
-        if self.socket_server and not self.ftp_server and not self.fenchmarksself.socket_server:
+            self.logger.info(f"FTP server stopped for {self.ip_address}")
+        if self.socket_server:
             self.socket_server.close()
-            print(f"Socket server stopped for {self.ip_address}")
+            self.logger.info(f"Socket server stopped for {self.ip_address}")
 
     def _handle_socket_connections(self):
         """Handle incoming socket connections from nodes."""
@@ -164,7 +178,7 @@ class FTPServerManager:
                 client_socket, addr = self.socket_server.accept()
                 threading.Thread(target=self._process_socket_message, args=(client_socket,), daemon=True).start()
             except Exception as e:
-                print(f"Socket server error: {e}")
+                self.logger.error(f"Socket server error: {e}", exc_info=True)
                 break
 
     def _process_socket_message(self, client_socket):
@@ -174,20 +188,20 @@ class FTPServerManager:
             message = json.loads(data)
             if message.get("action") == "node_started":
                 node_name = message.get("node_name")
-                print(f"Node {node_name} started, checking for pending files")
+                self.logger.info(f"Node {node_name} started, checking for pending files")
                 with self.active_nodes_lock:
                     self.active_nodes.add(node_name)  # Mark node as active
                 self.network.forward_file(None, node_name)
             client_socket.close()
         except Exception as e:
-            print(f"Error processing socket message: {e}")
+            self.logger.error(f"Error processing socket message: {e}", exc_info=True)
             client_socket.close()
 
     def check_node_and_forward(self, folder_name, target_node, file_path, original_filename):
         """Check if the target node is available and forward the file."""
         with self.active_nodes_lock:
             if target_node in self.active_nodes:
-                print(f"Target node {target_node} is active, forwarding file {original_filename}")
+                self.logger.info(f"Target node {target_node} is active, forwarding file {original_filename}")
                 self.network.forward_file(folder_name, target_node)
             else:
-                print(f"Target node {target_node} is not active, keeping file {original_filename} in pending")
+                self.logger.warning(f"Target node {target_node} is not active, keeping file {original_filename} in pending")

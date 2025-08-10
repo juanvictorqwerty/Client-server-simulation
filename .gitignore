@@ -6,3 +6,6 @@ assets/
 
 #vscode
 .vscode/
+
+#server log
+server.log
